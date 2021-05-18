@@ -138,10 +138,10 @@ extern const int systemDelay  = 0;
 extern const int imuQueLength = 200;
 
 extern const float sensorMinimumRange = 3.0;            // x²+y²+z² = range,最小的点与雷达的深度
-extern const float sensorMountAngle = 0.0;
+extern const float sensorMountAngle = 0.0;              // 安装角度 0°
 extern const float segmentTheta     = 60.0/180.0*M_PI;  // decrease this value may improve accuracy. 1.0472 点云分割时的角度跨度上限（π/3）
 
-extern const int segmentValidPointNum = 5;              // 检查上下左右连续5个点做为分割的特征依据
+extern const int segmentValidPointNum = 5;              // 检查上下左右连续5个点做为分割的特征依据,如果一个点没有5个与他相同标签邻域点，那么分割无效
 extern const int segmentValidLineNum = 3;
 extern const float segmentAlphaX = ang_res_x / 180.0 * M_PI;
 extern const float segmentAlphaY = ang_res_y / 180.0 * M_PI;

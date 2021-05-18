@@ -18,7 +18,7 @@ class TicToc
 {
 private:
     std::chrono::time_point<std::chrono::system_clock> start, end;
-    bool disp_ false;
+    bool disp_ = false;
 
 public:
     TicToc()

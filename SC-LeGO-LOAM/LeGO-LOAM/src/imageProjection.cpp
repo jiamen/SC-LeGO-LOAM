@@ -6,7 +6,6 @@
 //      订阅点云数据回调处理->点云转换到pcl预处理->截取一帧激光数据->投影映射到图像->地面移除->点云分割->发布点云数据->重置参数;
 
 
-
 #include "utility.h"
 
 class ImageProjection
@@ -32,13 +31,15 @@ private:
 
     // 深度图点云：以一维形式存储与深度图像素一一对应的点云数据
     pcl::PointCloud<PointType>::Ptr fullCloud;          // projected velodyne raw cloud, but saved in the form of 1-D matrix
+    // I值 = intensity = (float) rowIdn + (float) columnIdn / 10000.0;
     // 带距离值的深度图点云:与深度图点云存储一致的数据，但是其属性intensity记录的是距离值,   range = x²+y²+z² ,最小的点与雷达的深度
     pcl::PointCloud<PointType>::Ptr fullInfoCloud;      // same as fullCloud, but with intensity - range  每个点的
+    // I值 = intensity = range
 
     // 注：所有点分为被分割点、未被分割点、地面点、无效点。
     pcl::PointCloud<PointType>::Ptr groundCloud;        // 地面点点云
-    pcl::PointCloud<PointType>::Ptr segmentedCloud;     // segMsg 点云数据:包含被分割点和经过降采样的地面点
-    pcl::PointCloud<PointType>::Ptr segmentedCloudPure; // 存储被分割点点云，且每个点的i值为分割标志值
+    pcl::PointCloud<PointType>::Ptr segmentedCloud;     // segMsg 点云数据:包含被分割点和经过降采样的地面点，intensity=
+    pcl::PointCloud<PointType>::Ptr segmentedCloudPure; // 可视化点订阅，存储被分割点点云，且每个点的i值为分割标志值
     pcl::PointCloud<PointType>::Ptr outlierCloud;       // 经过降采样的未分割点
 
     // 每次fullCloud和fullInfoCloud的点云初始化就会填入下面这种数据，这构造函数中进行初始化
@@ -59,7 +60,7 @@ private:
     // 每个点的邻域索引
     std::vector<std::pair<int8_t, int8_t>> neighborIterator;
 
-    uint16_t* allPushedIndX;        // array for tracking points of a segmented object.
+    uint16_t* allPushedIndX;        // array for tracking points of a segmented object. 当前点所在的物体分割类的所有索引，隶属于同一个被分割的物体
     uint16_t* allPushedIndY;
 
     uint16_t* queueIndX;            // array for breadth-first search process of segmentation, for speed
@@ -69,7 +70,7 @@ private:
 public:
     ImageProjection() : nh("~")
     {
-        subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2> ("full_cloud_projected", 1, &ImageProjection::cloudHandler, this);
+        subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2> (pointCloudTopic, 1, &ImageProjection::cloudHandler, this);
 
         pubFullCloud  = nh.advertise<sensor_msgs::PointCloud2>("/full_cloud_projected", 1);
         pubFullInfoCloud = nh.advertise<sensor_msgs::PointCloud2>("/full_cloud_info", 1);
@@ -102,7 +103,7 @@ public:
 
         groundCloud.reset(new pcl::PointCloud<PointType>());
         segmentedCloud.reset(new pcl::PointCloud<PointType>());
-        segmentedCloud.reset(new pcl::PointCloud<PointType>());
+        segmentedCloudPure.reset(new pcl::PointCloud<PointType>());
         outlierCloud.reset(new pcl::PointCloud<PointType>());
 
         fullCloud->points.resize(N_SCAN*Horizon_SCAN);
@@ -157,7 +158,7 @@ public:
     // 回调函数第1步：把ros点云消息数据结构 转换为 PCL点云数据结构
     void copyPointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg)
     {
-        cloudHeader = laserCloudMsg->header;        // 雷达点云头
+        cloudHeader = laserCloudMsg->header;        // 保存雷达点云头
         cloudHeader.stamp = ros::Time::now();       // Ouster lidar users may need to uncomment this line
         pcl::fromROSMsg(*laserCloudMsg, *laserCloudIn);     //
 
@@ -231,6 +232,7 @@ public:
                 continue;
 
             // 注意查看 VELODYNE 雷达数据， 这里在一圈中角度结合上面在哪一行可以确定点的位置
+            // △△△△△△   下面这几句很不好理解：总体意思是根据角度得到一条线上的点索引    □□□□□□□□□
             horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
 
             columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
@@ -256,44 +258,340 @@ public:
         }
     }
 
-    // 回调函数第4步：找到开始和结束的角度
+    // 回调函数第4步：区分地面点云与非地面点云
     void groundRemoval()
     {
+        size_t lowerInd, upperInd;
+        float diffX, diffY, diffZ, angle;
 
+        // groundMat
+        // -1, no valid info to check if ground or not
+        // 0, initial value, after validation, means not ground
+        // 1, ground after validation
+
+        for (size_t j=0; j<Horizon_SCAN; j ++)              // 一圈中的哪个点
+        {
+            for (size_t i=0; i<groundScanInd; i ++)         // 在哪一条线上
+            {
+                lowerInd = j + (i)*Horizon_SCAN;
+                upperInd = j + (i+1)*Horizon_SCAN;
+
+                if (fullCloud->points[lowerInd].intensity == -1 ||
+                    fullCloud->points[upperInd].intensity == -1)
+                {
+                    groundMat.at<int8_t>(i, j) = -1;
+                    continue;           // 无法验证点，直接跳过
+                }
+
+                diffX = fullCloud->points[upperInd].x - fullCloud->points[lowerInd].x;
+                diffY = fullCloud->points[upperInd].y - fullCloud->points[lowerInd].y;
+                diffZ = fullCloud->points[upperInd].z - fullCloud->points[lowerInd].z;
+
+                angle = atan2(diffZ, sqrt(diffX*diffX + diffY*diffY)) * 180 / M_PI;
+
+                if (abs(angle-sensorMountAngle) <= 10)
+                {
+                    groundMat.at<int8_t>(i, j) = 1;
+                    groundMat.at<int8_t>(i+1, j) = 1;
+                }
+            }
+        }
+
+        // extract ground cloud (groundMat == 1)  从所有点云中提取地面点云
+        // mark entry that doesn't need to label (ground and invalid point) for segmentation
+        // note that ground remove is from 0~N_SCAN-1, need rangeMat for mark label matrix for the 16th scan
+        for (size_t i=0; i<N_SCAN; i ++)                // 64条线
+        {
+            for (size_t j=0; j<Horizon_SCAN; j ++)      // 每条线上1024个点
+            {
+                // 如果是地面点云 或者 是无效点，labelMat矩阵中标记为-1
+                if (groundMat.at<int8_t>(i, j) == 1 || rangeMat.at<float>(i,j) == FLT_MAX)
+                {
+                    labelMat.at<int>(i, j) = -1;
+                }
+            }
+        }
+        // 如果发布的地面点云有订阅者的话，用PCL点云数据结构专门存储地面点云
+        if (pubGroundCloud.getNumSubscribers() != 0)
+        {
+            for (size_t i=0; i<=groundScanInd; i ++)
+            {
+                for (size_t j=0; j<Horizon_SCAN; j ++)
+                {
+                    if (groundMat.at<int8_t>(i, j) == 1)
+                    {
+                        groundCloud->push_back(fullCloud->points[j + i*Horizon_SCAN]);
+                    }
+                }
+            }
+        }
     }
 
-    // 回调函数第5步：点云分割
+    // 回调函数第5步：点云分割，包含每个点的label标签 标记
     void cloudSegmentation()
     {
+        // segmentation process
+        for (size_t i=0; i<N_SCAN; i ++)                // 在哪一条线上
+        {
+            for (size_t j=0; j<Horizon_SCAN; j ++)      // 一条线上的哪个点
+            {
+                if (labelMat.at<int>(i, j) == 0)
+                    labelComponents(i, j);
+            }
+        }
 
+        int sizeOfSegCloud = 0;         // 已分割点云的数量
+        // extract segmented cloud for lidar odometry
+        // 为雷达里程计提取分割过的点云
+        for (size_t i=0; i<N_SCAN; i ++)
+        {
+            segMsg.startRingIndex[i] = sizeOfSegCloud-1 + 5;    // 每个环起始点的坐标索引，还扣掉了5个点
+
+            for (size_t j=0; j<Horizon_SCAN; j ++)
+            {
+                // 如果标签矩阵不为0，或者已经是地面点，就存入待发布的
+                if (labelMat.at<int>(i,j) > 0 || groundMat.at<int8_t>(i,j)==1)
+                {
+                    // outliers that will not be used for optimization (always continue)
+                    // 进一步判断 标签矩阵中值 是否合理
+                    if (labelMat.at<int>(i,j) == 999999)
+                    {
+                        // 离群点选取在高于地面15根线之上，并且列索引是5的倍数
+                        if (i>groundScanInd && j%5 == 0)
+                        {
+                            outlierCloud->push_back(fullCloud->points[j + i*Horizon_SCAN]);
+                            continue;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+                    // majority of ground points are skipped    地面点云降采样
+                    if (groundMat.at<int8_t>(i,j) == 1)
+                    {
+                        if (j%5!=0 && j>5 && j<Horizon_SCAN-5)
+                            continue;
+                    }
+                    // mark ground points so they will not be considered as edge features later
+                    // 保存是否为地面，如果是地面的话，后面就不会再被考虑成边特征
+                    segMsg.segmentedCloudGroundFlag[sizeOfSegCloud] = (groundMat.at<int8_t>(i,j) == 1);
+                    // mark the points' column index for marking occlusion later
+                    segMsg.segmentedCloudColInd[sizeOfSegCloud] = j;
+                    // save range info  保存距离信息
+                    segMsg.segmentedCloudRange[sizeOfSegCloud]  = rangeMat.at<float>(i,j);
+
+                    // save seg cloud   保存点云原xyzI信息
+                    segmentedCloud->push_back(fullCloud->points[j + i*Horizon_SCAN]);
+
+                    // size of seg cloud  已分割点云数量 + 1
+                    ++ sizeOfSegCloud;
+                }
+            }
+
+            segMsg.endRingIndex[i] = sizeOfSegCloud-1 - 5;      // 每个环结束点的坐标索引，还扣掉了5个点
+        }
+
+        // extract segmented cloud for visualization，
+        if (pubSegmentedCloudPure.getNumSubscribers() != 0)
+        {
+            for (size_t i=0; i<N_SCAN; i ++)
+            {
+                for (size_t j=0; j<Horizon_SCAN; j ++)
+                {
+                    if (labelMat.at<int>(i,j) >0 && labelMat.at<int>(i,j) != 999999)
+                    {
+                        segmentedCloudPure->push_back(fullCloud->points[j+i*Horizon_SCAN]);
+                        segmentedCloudPure->points.back().intensity = labelMat.at<int>(i, j);
+                    }
+                }
+            }
+        }
     }
 
     // 回调函数第6步：发布处理后的点云数据
     void publishCloud()
     {
+        // 1. Publish Seg Cloud Info  使用自创的点云数据结构segMsg
+        segMsg.header = cloudHeader;
+        pubSegmentedCloudInfo.publish(segMsg);
+        // 2. Publish clouds
+        sensor_msgs::PointCloud2 laserCloudTemp;
 
+        // 发布15条地线上面的离群点
+        pcl::toROSMsg(*outlierCloud, laserCloudTemp);
+        laserCloudTemp.header.stamp = cloudHeader.stamp;        // 时间戳
+        laserCloudTemp.header.frame_id = "base_link";
+        pubOutlierCloud.publish(laserCloudTemp);
+
+        // segmented cloud with ground，包含地面的分割点云
+        pcl::toROSMsg(*segmentedCloud, laserCloudTemp);
+        laserCloudTemp.header.stamp = cloudHeader.stamp;
+        laserCloudTemp.header.frame_id = "base_link";
+        pubSegmentedCloud.publish(laserCloudTemp);
+
+        // projected full cloud   全部点云
+        if (pubFullCloud.getNumSubscribers() != 0)
+        {
+            pcl::toROSMsg(*fullCloud, laserCloudTemp);
+            laserCloudTemp.header.stamp = cloudHeader.stamp;
+            laserCloudTemp.header.frame_id = "base_link";
+            pubFullCloud.publish(laserCloudTemp);
+        }
+        // original dense ground cloud  稠密地面点云
+        if (pubGroundCloud.getNumSubscribers() != 0)
+        {
+            pcl::toROSMsg(*groundCloud, laserCloudTemp);
+            laserCloudTemp.header.stamp = cloudHeader.stamp;
+            laserCloudTemp.header.frame_id = "base_link";
+            pubGroundCloud.publish(laserCloudTemp);
+        }
+        // original dense ground cloud
+        if (pubSegmentedCloudPure.getNumSubscribers() != 0)
+        {
+            pcl::toROSMsg(*segmentedCloudPure, laserCloudTemp);
+            laserCloudTemp.header.stamp = cloudHeader.stamp;
+            laserCloudTemp.header.frame_id = "base_link";
+            pubSegmentedCloudPure.publish(laserCloudTemp);
+        }
+        // projected full cloud info
+        if (pubFullInfoCloud.getNumSubscribers() != 0)
+        {
+            pcl::toROSMsg(*fullInfoCloud, laserCloudTemp);
+            laserCloudTemp.header.stamp = cloudHeader.stamp;
+            laserCloudTemp.header.frame_id = "base_link";
+            pubFullInfoCloud.publish(laserCloudTemp);
+        }
     }
 
     // 回调函数第7步：重置参数，清空此次的点云变量
     void resetParameters()
     {
-        laserCloudIn->clear();
+        laserCloudIn->clear();              // 最初接收的激光雷达点云清空
         groundCloud->clear();
         segmentedCloud->clear();
         segmentedCloudPure->clear();
-        outlierCloud->clear();              //
+        outlierCloud->clear();              // 离散点清空
 
         rangeMat  = cv::Mat(N_SCAN, Horizon_SCAN, CV_32F, cv::Scalar::all(FLT_MAX));
         groundMat = cv::Mat(N_SCAN, Horizon_SCAN, CV_8S, cv::Scalar::all(0));
         labelMat  = cv::Mat(N_SCAN, Horizon_SCAN, CV_32S, cv::Scalar::all(0));
-        labelCount = 1;
+        labelCount = 1;                     // 分割后有几个标签
 
         std::fill(fullCloud->points.begin(), fullCloud->points.end(), nanPoint);
         std::fill(fullInfoCloud->points.begin(), fullInfoCloud->points.end(), nanPoint);
     }
 
-};
 
+    void labelComponents(int row, int col)
+    {
+        // use std::queue std::vector std::deque will slow the program down greatly
+        float d1, d2, alpha, angle;
+        int fromIndX, fromIndY, thisIndX, thisIndY;
+        bool lineCountFlag[N_SCAN] = {false};
+
+        queueIndX[0] = row;             // 行，在哪条线上
+        queueIndY[0] = col;             // 列，在一条线的哪个点上
+
+        int queueSize = 1;              // 队列中点的数量
+        int queueStartInd = 0;          // 队列起始索引
+        int queueEndInd = 1;            // 队列结束索引
+
+        allPushedIndX[0] = row;
+        allPushedIndY[0] = col;
+        int allPushedIndSize = 1;
+
+        while (queueSize > 0)
+        {
+            // Pop point，起始点的（X，Y）坐标
+            fromIndX = queueIndX[queueStartInd];
+            fromIndY = queueIndY[queueStartInd];
+            -- queueSize;
+            ++ queueStartInd;
+            // Mark popped point  标记当前点的标签号，把这个点当作中心点，遍历上下所有四个邻域点
+            labelMat.at<int>(fromIndX, fromIndY) = labelCount;
+            // Loop through all the neighboring grids of popped grid
+            for (auto iter=neighborIterator.begin(); iter!=neighborIterator.end(); iter ++)
+            {
+                // new index
+                thisIndX = fromIndX + (*iter).first;
+                thisIndY = fromIndY + (*iter).second;
+
+                // index should be within the boundary
+                if (thisIndX<0 || thisIndX>=N_SCAN)
+                    continue;
+
+                // at range image margin (left or right side)  注意是一个圈，值在[0, 1024]之间循环
+                if (thisIndY < 0)
+                    thisIndY = Horizon_SCAN - 1;
+                if (thisIndY >= Horizon_SCAN)
+                    thisIndY = 0;
+
+                // prevent infinite loop (caused by put already examined point back)  如果本点已经有标记了，则跳过，防止无限循环
+                if (labelMat.at<int>(thisIndX, thisIndY) != 0)
+                    continue;
+
+                // 比较邻域点和中心点与激光雷达的距离大小
+                d1 = std::max(rangeMat.at<float>(fromIndX, thisIndY),
+                              rangeMat.at<float>(thisIndX, thisIndY));
+                d2 = std::min(rangeMat.at<float>(fromIndX, fromIndY),
+                              rangeMat.at<float>(thisIndX, thisIndY));
+
+                if ((*iter).first == 0)
+                    alpha = segmentAlphaX;
+                else
+                    alpha = segmentAlphaY;
+
+                angle = atan2(d2*sin(alpha), (d1-d2* cos(alpha)));
+
+                // 如果 β 大于一定的阈值，说明两者之间没有突变，所以可以认为是同一个聚类
+                if (angle > segmentTheta)       // segmentTheta = π/3
+                {
+                    queueIndX[queueEndInd] = thisIndX;
+                    queueIndY[queueEndInd] = thisIndY;
+                    ++ queueSize;               // 队列长度加1， while继续循环
+                    ++ queueEndInd;             // 结束队列索引 后移
+
+                    labelMat.at<int>(thisIndX, thisIndY) = labelCount;
+                    lineCountFlag[thisIndX] = true;
+
+                    allPushedIndX[allPushedIndSize] = thisIndX;         // 当前点所在的物体分割类的所有索引都存到allPushIndX、Y中
+                    allPushedIndY[allPushedIndSize] = thisIndY;
+                    ++ allPushedIndSize;
+                }
+            }
+        }
+
+        // check if this segment is valid   检查这次分割是否有效
+        bool feasibleSegment = false;
+        if (allPushedIndSize >= 30)
+            feasibleSegment = true;
+        else if (allPushedIndSize >= segmentValidPointNum)
+        {
+            int lineCount = 0;
+            for (size_t i=0; i<N_SCAN; i ++)
+                if (lineCountFlag[i] == true)
+                    lineCount ++;
+            if (lineCount >= segmentValidLineNum)   // segmentValidLineNum=3
+                feasibleSegment = true;
+        }
+
+        // segment is valid, mark these points      分割是有效的，标记上面的点，并且把标签labelCount++
+        if (feasibleSegment == true)
+        {
+            ++ labelCount;
+        }
+        else
+        {
+            for (size_t i=0; i < allPushedIndSize; i ++)
+            {
+                labelMat.at<int>(allPushedIndX[i], allPushedIndY[i]) = 999999;
+            }
+        }
+    }
+
+
+};
 
 
 int main(int argc, char* *argv)

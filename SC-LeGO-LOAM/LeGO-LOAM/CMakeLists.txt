@@ -43,6 +43,28 @@ add_executable(imageProjection src/imageProjection.cpp)
 add_dependencies(imageProjection ${catkin_EXPORTED_TARGETS} cloud_msgs_gencpp)
 target_link_libraries(imageProjection ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
+add_executable(featureAssociation src/featureAssociation.cpp)
+add_dependencies(featureAssociation ${catkin_EXPORTED_TARGETS} cloud_msgs_gencpp)
+target_link_libraries(featureAssociation ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+
+add_executable(mapOptmization
+        src/mapOptmization.cpp
+        src/Scancontext.cpp
+        )
+target_link_libraries(mapOptmization
+        ${catkin_LIBRARIES}
+        ${PCL_LIBRARIES}
+        ${OpenCV_LIBRARIES}
+        gtsam
+        # Eigen3::Eigen
+        )
+
+add_executable(transformFusion src/transformFusion.cpp)
+target_link_libraries(transformFusion ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+
+
+add_executable(mapLoader src/mapLoader.cpp)
+target_link_libraries(mapLoader ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
 
 
 #add_executable(mapOptmization
